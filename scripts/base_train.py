@@ -49,6 +49,7 @@ parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["ro
 # Model architecture
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
+parser.add_argument("--model-dim", type=int, default=-1, help="override model dimension directly (-1 = derive from depth * aspect_ratio)")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
@@ -128,10 +129,15 @@ print0(f"Vocab size: {vocab_size:,}")
 
 def build_model_meta(depth):
     """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
-    # Model dim is nudged up to nearest multiple of head_dim for clean division
-    # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
-    base_dim = depth * args.aspect_ratio
-    model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
+    if args.model_dim != -1:
+        model_dim = args.model_dim
+        assert model_dim > 0, f"model_dim must be positive, got {model_dim}"
+        assert model_dim % args.head_dim == 0, f"model_dim ({model_dim}) must be divisible by head_dim ({args.head_dim})"
+    else:
+        # Model dim is nudged up to nearest multiple of head_dim for clean division
+        # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
+        base_dim = depth * args.aspect_ratio
+        model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
