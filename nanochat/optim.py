@@ -373,6 +373,8 @@ class DistMuonAdamW(torch.optim.Optimizer):
         param_infos = {}
         for p in group['params']:
             grad = p.grad
+            if grad is None:
+                continue
             if p.numel() < 1024:
                 # Small params: all_reduce (no scatter/gather needed)
                 future = dist.all_reduce(grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
@@ -411,6 +413,8 @@ class DistMuonAdamW(torch.optim.Optimizer):
         """Wait for reduce, compute AdamW updates, launch gathers for large params."""
         param_infos = info['param_infos']
         for p in group['params']:
+            if p not in param_infos:
+                continue
             pinfo = param_infos[p]
             pinfo['future'].wait()
             grad_slice = pinfo['grad_slice']

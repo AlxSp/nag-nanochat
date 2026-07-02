@@ -38,6 +38,8 @@ class GPTConfig:
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
 
+# def get_norm(x):
+#     return F.norm
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),)) # note that this will run in bf16, seems ok
@@ -47,7 +49,8 @@ class Linear(nn.Linear):
     Replaces autocast: master weights stay fp32 for optimizer precision,
     but matmuls run in the activation dtype (typically bf16 from embeddings)."""
     def forward(self, x):
-        return F.linear(x, self.weight.to(dtype=x.dtype))
+        bias = None if self.bias is None else self.bias.to(dtype=x.dtype)
+        return F.linear(x, self.weight.to(dtype=x.dtype), bias)
 
 
 def has_ve(layer_idx, n_layer):
@@ -77,7 +80,7 @@ class CausalSelfAttention(nn.Module):
         self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 12
-        self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        self.ve_gate = None
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
@@ -138,17 +141,42 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return x
 
+class NAGResBranch(nn.Module):
+    def __init__(self, config, layer_idx):
+        super().__init__()
 
+        self.m_down = Linear(config.n_embd, 32, bias=True)
+        self.coef = nn.Parameter(torch.zeros(32))
+        self.beta = nn.Parameter(torch.zeros(1))
+
+        self.alpha = nn.Parameter(torch.zeros(1))
+
+    def forward(self, res_log_norm, res_dir, branch_out):
+        modulator = (F.softmax(self.coef, dim=0) * F.sigmoid(self.m_down(res_dir))).sum(dim=-1).pow(F.softplus(self.beta) + 1e-16).unsqueeze(-1)
+
+        centered_x = branch_out - branch_out.mean(dim=-1, keepdim=True)
+        orth_x = centered_x - res_dir * (centered_x * res_dir).sum(dim=-1, keepdim = True) / torch.square(res_dir).sum(dim = -1, keepdim = True)
+        orth_x = norm(orth_x)
+
+        norm_gain_sq = 1 + (modulator * self.alpha).square()
+        res_dir = (res_dir + modulator * self.alpha * orth_x) / torch.sqrt(norm_gain_sq)
+        res_log_norm = res_log_norm + torch.log(norm_gain_sq) * 0.5
+
+        return res_log_norm, res_dir
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
+        self.attn_branch = NAGResBranch(config, layer_idx)
         self.mlp = MLP(config)
+        self.mlp_branch = NAGResBranch(config, layer_idx)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
-        x = x + self.mlp(norm(x))
-        return x
+    def forward(self, res_log_norm, res_dir, ve, cos_sin, window_size, kv_cache):
+
+        res_log_norm, res_dir = self.attn_branch(res_log_norm, res_dir, self.attn(res_dir, ve, cos_sin, window_size, kv_cache))
+        res_log_norm, res_dir = self.mlp_branch(res_log_norm, res_dir, self.mlp(res_dir))
+
+        return res_log_norm, res_dir
 
 
 class GPT(nn.Module):
@@ -173,21 +201,22 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
+        self.g_log_encode = nn.Parameter(torch.zeros(1)) # set g encode log to have no impact at first
         # Per-layer learnable scalars (inspired by modded-nanogpt)
         # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
         # x0_lambdas: blends initial embedding back in at each layer (init 0.0 = disabled)
         # Separate parameters so they can have different optimizer treatment
-        self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))   # fake init, real init in init_weights()
-        self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))     # fake init, real init in init_weights()
+        # self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))   # fake init, real init in init_weights()
+        # self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))     # fake init, real init in init_weights()
         # Smear: mix previous token's embedding into current token (cheap bigram-like info)
-        self.smear_gate = Linear(24, 1, bias=False)
-        self.smear_lambda = nn.Parameter(torch.zeros(1))
+        # self.smear_gate = Linear(24, 1, bias=False)
+        # self.smear_lambda = nn.Parameter(torch.zeros(1))
         # Backout: subtract cached mid-layer residual before final norm to remove low-level features
-        self.backout_lambda = nn.Parameter(0.2 * torch.ones(1))
+        # self.backout_lambda = nn.Parameter(0.2 * torch.ones(1))
         # Value embeddings (ResFormer-style): alternating layers, last layer always included
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
-        self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        # self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -197,6 +226,13 @@ class GPT(nn.Module):
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
+
+    @torch.no_grad()
+    def constrain_emb(self):
+        self.transformer.wte.weight.sub_(self.transformer.wte.weight.mean(dim=-1, keepdim=True))
+        self.lm_head.weight.sub_(self.lm_head.weight.mean(dim=-1, keepdim=True))
+        self.lm_head.weight.copy_(norm(self.lm_head.weight))
+
 
     @torch.no_grad()
     def init_weights(self):
@@ -214,43 +250,60 @@ class GPT(nn.Module):
             mlp.c_proj:      zeros
         """
 
-        # Embedding and unembedding
+        # Embedding and unembedding, explicitly centered at 0 as per paper and normalized lmhead
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=0.8)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+        self.constrain_emb()
+
+        self.g_log_encode.fill_(0.0)
 
         # Transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
-        for block in self.transformer.h:
+        for i, block in enumerate(self.transformer.h):
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            
+            torch.nn.init.uniform_(block.attn_branch.m_down.weight, -s, s)
+            block.attn_branch.m_down.bias.zero_()
+            block.attn_branch.alpha.fill_((i * 2 + 1) ** -0.5)
+            block.attn_branch.beta.fill_(0.5413)
+            block.attn_branch.coef.zero_()
+            
+            torch.nn.init.uniform_(block.mlp_branch.m_down.weight, -s, s)
+            block.mlp_branch.m_down.bias.zero_()
+            block.mlp_branch.alpha.fill_((i * 2 + 2) ** -0.5)
+            block.mlp_branch.beta.fill_(0.5413)
+            block.mlp_branch.coef.zero_()
+
+
 
         # Per-layer scalars
         # Per-layer resid init: stronger residual at early layers, weaker at deep layers
         n_layer = self.config.n_layer
-        for i in range(n_layer):
-            self.resid_lambdas.data[i] = 1.15 - (0.10 * i / max(n_layer - 1, 1))
-        # Decaying x0 init: earlier layers get more input embedding blending
-        for i in range(n_layer):
-            self.x0_lambdas.data[i] = 0.20 - (0.15 * i / max(n_layer - 1, 1))
+        # for i in range(n_layer):
+        #     self.resid_lambdas.data[i] = 1.15 - (0.10 * i / max(n_layer - 1, 1))
+        # # Decaying x0 init: earlier layers get more input embedding blending
+        # for i in range(n_layer):
+        #     self.x0_lambdas.data[i] = 0.20 - (0.15 * i / max(n_layer - 1, 1))
 
         # Smear/backout scalars and smear gate must be explicitly initialized 
-        torch.nn.init.zeros_(self.smear_lambda)
-        torch.nn.init.constant_(self.backout_lambda, 0.2)
-        torch.nn.init.uniform_(self.smear_gate.weight, 0.0, 0.02)
+        # torch.nn.init.zeros_(self.smear_lambda)
+        # torch.nn.init.constant_(self.backout_lambda, 0.2)
+        # torch.nn.init.uniform_(self.smear_gate.weight, 0.0, 0.02)
 
         # Value embeddings (init like c_v: uniform with same std)
-        for ve in self.value_embeds.values():
-            torch.nn.init.uniform_(ve.weight, -s, s)
+        # for ve in self.value_embeds.values():
+        #     torch.nn.init.uniform_(ve.weight, -s, s)
 
         # Gate weights init with small positive values so gates start slightly above neutral
-        for block in self.transformer.h:
-            if block.attn.ve_gate is not None:
-                torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
+        # for block in self.transformer.h:
+        #     if block.attn.ve_gate is not None:
+        #         torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
@@ -262,8 +315,8 @@ class GPT(nn.Module):
         # because GradScaler cannot unscale fp16 gradients.
         if COMPUTE_DTYPE != torch.float16:
             self.transformer.wte.to(dtype=COMPUTE_DTYPE)
-            for ve in self.value_embeds.values():
-                ve.to(dtype=COMPUTE_DTYPE)
+            # for ve in self.value_embeds.values():
+            #     ve.to(dtype=COMPUTE_DTYPE)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=100000, device=None):
         # TODO: bump base theta more? e.g. 100K is more common more recently
@@ -328,10 +381,8 @@ class GPT(nn.Module):
         """
         nparams = sum(p.numel() for p in self.parameters())
         # Exclude non-matmul params: embeddings and per-layer scalars
-        value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
-        nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
-                          self.resid_lambdas.numel() + self.x0_lambdas.numel() +
-                          self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel())
+        # value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
+        nparams_exclude = (self.transformer.wte.weight.numel())
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
@@ -356,15 +407,15 @@ class GPT(nn.Module):
         """
         # Count each group separately (mirrors the grouping in setup_optimizers)
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
-        value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
+        # value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
-        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        scalars = self.g_log_encode.numel()
+        total = wte  + lm_head + transformer_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
             'wte': wte,
-            'value_embeds': value_embeds,
+            # 'value_embeds': value_embeds,
             'lm_head': lm_head,
             'transformer_matrices': transformer_matrices,
             'scalars': scalars,
@@ -376,14 +427,67 @@ class GPT(nn.Module):
         ddp, rank, local_rank, world_size = get_dist_info()
 
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
-        value_embeds_params = list(self.value_embeds.parameters())
+        # matrix_params = list(self.transformer.h.parameters())
+        matrix_params = [
+            weight
+            for block in self.transformer.h
+            for weight in [
+                block.attn.c_q.weight,
+                block.attn.c_k.weight,
+                block.attn.c_v.weight,
+                block.attn.c_proj.weight,
+                block.mlp.c_fc.weight,
+                block.mlp.c_proj.weight,
+            ]
+        ]
+
+        alphas = [
+            weight
+            for block in self.transformer.h
+            for weight in [
+                block.attn_branch.alpha,
+                block.mlp_branch.alpha
+            ]    
+        ]
+
+        betas = [
+            weight
+            for block in self.transformer.h
+            for weight in [
+                block.attn_branch.beta,
+                block.mlp_branch.beta
+            ]    
+        ]
+
+        coefs = [
+            weight
+            for block in self.transformer.h
+            for weight in [
+                block.attn_branch.coef,
+                block.mlp_branch.coef
+            ]    
+        ]
+
+        m_downs = [
+            weight
+            for block in self.transformer.h
+            for weight in [
+                block.attn_branch.m_down.weight,
+                block.mlp_branch.m_down.weight,
+                block.attn_branch.m_down.bias,
+                block.mlp_branch.m_down.bias
+            ]    
+        ]
+
+
+        # value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
-        resid_params = [self.resid_lambdas]
-        x0_params = [self.x0_lambdas]
-        smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        # resid_params = [self.resid_lambdas]
+        # x0_params = [self.x0_lambdas]
+        # smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
+        nag_params = [self.g_log_encode] + alphas + betas + coefs + m_downs
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(nag_params) #+ len(value_embeds_params) # + len(resid_params) + len(x0_params) + len(smear_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -394,10 +498,15 @@ class GPT(nn.Module):
             # AdamW groups (embeddings, lm_head, scalars)
             dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
-            dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
-            dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
-            dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
-            dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=[self.g_log_encode], lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=alphas, lr=matrix_lr, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=betas, lr=matrix_lr, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=coefs, lr=matrix_lr, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=m_downs, lr=matrix_lr, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
+            # dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
+            # dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
+            # dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
+            # dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
@@ -425,51 +534,41 @@ class GPT(nn.Module):
         cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
 
         # Embed the tokens
-        x = self.transformer.wte(idx) # embed current token
-        x = x.to(COMPUTE_DTYPE) # ensure activations are in compute dtype (no-op usually, but active for fp16 code path)
-        x = norm(x)
+        emb = self.transformer.wte(idx) # embed current token
+        rho = emb.float().norm(dim=-1, keepdim=True) / (self.config.n_embd ** 0.5)
+
+        res_log_norm = rho.log() + self.g_log_encode #.float() # before compute_dtype cast to keep in high-precision?
+        res_dir = emb.to(COMPUTE_DTYPE) / rho.to(COMPUTE_DTYPE)
+
+        # x = emb * self.g_encode
+        # x = x.to(COMPUTE_DTYPE) # ensure activations are in compute dtype (no-op usually, but active for fp16 code path)
 
         # Smear: mix previous token's embedding into current position (cheap bigram info)
-        if kv_cache is None:
-            # Training / naive generate: full sequence available, use fast slice
-            assert T > 1, "Training forward pass should have T > 1"
-            gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
-            x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
-        else:
-            # KV cache inference: read prev embedding from cache, store current for next step
-            x_pre_smear = kv_cache.prev_embedding
-            kv_cache.prev_embedding = x[:, -1:, :]
-            if T > 1:
-                # Prefill: apply smear to positions 1+, same as training
-                gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
-                x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
-            elif x_pre_smear is not None:
-                # Decode: single token, use cached prev embedding
-                gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, :, :24]))
-                x = x + gate * x_pre_smear
+        # if kv_cache is not None:
+        #     # Training / naive generate: full sequence available, use fast slice
+        #     assert T > 1, "Training forward pass should have T > 1"
+        #     gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
+        #     x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
+        # else:
+        #     # KV cache inference: read prev embedding from cache, store current for next step
+        #     x_pre_smear = kv_cache.prev_embedding
+            # kv_cache.prev_embedding = x[:, -1:, :]
+        #     if T > 1:
+        #         # Prefill: apply smear to positions 1+, same as training
+        #         gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
+        #         x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
+        #     elif x_pre_smear is not None:
+        #         # Decode: single token, use cached prev embedding
+        #         gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, :, :24]))
+        #         x = x + gate * x_pre_smear
 
-        # Forward the trunk of the Transformer
-        x0 = x  # save initial normalized embedding for x0 residual
-        n_layer = self.config.n_layer
-        backout_layer = n_layer // 2  # cache at halfway point
-        x_backout = None
         for i, block in enumerate(self.transformer.h):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
-            if i == backout_layer:
-                x_backout = x
-        # Subtract mid-layer residual to remove low-level features before logit projection
-        if x_backout is not None:
-            x = x - self.backout_lambda.to(x.dtype) * x_backout
-        x = norm(x)
-
+            res_log_norm, res_dir = block(res_log_norm, res_dir, None, cos_sin, self.window_sizes[i], kv_cache)
         # Forward the lm_head (compute logits)
-        softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
-        logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
+        logits = self.lm_head(res_dir)  / self.config.n_embd # since out embd table and res_dir have norm of sqrt(d), divide by d to get cos sim. (B, T, padded_vocab_size) <- very big tensor, large amount of memory
         logits = logits[..., :self.config.vocab_size] # slice to remove padding
-        logits = logits.float() # switch to fp32 for logit softcap and loss computation
-        logits = softcap * torch.tanh(logits / softcap) # squash the logits
+        logits = logits.float() # switch to fp32 for logit loss computation
+        logits = logits * res_log_norm.exp()
 
         if targets is not None:
             # training: given the targets, compute and return the loss
