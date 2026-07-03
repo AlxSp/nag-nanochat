@@ -1,0 +1,25 @@
+# NAG Baseline Comparison TODO
+
+- Run paired 8xH100/H200 comparison with the same scale:
+  - `--depth=64`
+  - `--model-dim=640`
+  - `--head-dim=128`
+  - `--window-pattern=L`
+  - `--max-seq-len=2048`
+  - `--target-flops=3e19`
+- Train both architectures:
+  - `--arch=nag-gpt`
+  - `--arch=gpt`
+- Keep comparison fair:
+  - same dataset/tokenizer
+  - same target FLOPs
+  - same batch size policy
+  - same eval/checkpoint cadence
+- Before launch:
+  - confirm available wall time is at least 4 hours per run
+  - confirm disk space for checkpoints/logs
+  - run a short smoke test on the target machine
+- After both runs:
+  - compare validation bpb at matched FLOPs
+  - inspect final checkpoints for NAG gain/modulator behavior
+  - compare throughput/MFU and actual trained tokens
