@@ -526,6 +526,20 @@ while True:
         else:
             loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+    local_nonfinite = torch.tensor(0, dtype=torch.int32, device=device)
+    if not torch.isfinite(train_loss):
+        local_nonfinite.fill_(1)
+    bad_grad_names = []
+    for name, p in orig_model.named_parameters():
+        if p.grad is not None and not torch.isfinite(p.grad).all():
+            local_nonfinite.fill_(1)
+            if len(bad_grad_names) < 10:
+                bad_grad_names.append(name)
+    if is_ddp_initialized():
+        dist.all_reduce(local_nonfinite, op=dist.ReduceOp.MAX)
+    if local_nonfinite.item():
+        detail = f"; local bad gradients: {bad_grad_names}" if bad_grad_names else ""
+        raise RuntimeError(f"Non-finite loss/gradient detected at step {step} before optimizer.step(){detail}")
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)

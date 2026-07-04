@@ -152,15 +152,16 @@ class NAGResBranch(nn.Module):
         self.alpha = nn.Parameter(torch.zeros(1))
 
     def forward(self, res_log_norm, res_dir, branch_out):
-        modulator = (F.softmax(self.coef, dim=0) * F.sigmoid(self.m_down(res_dir))).sum(dim=-1).pow(F.softplus(self.beta) + 1e-16).unsqueeze(-1)
+        modulator = (F.softmax(self.coef, dim=0) * F.sigmoid(self.m_down(res_dir))).sum(dim=-1).clamp_min(1e-6).pow(F.softplus(self.beta) + 1e-16).unsqueeze(-1) # clamp to avoid inf backward gradient when mod = 0
         branch_scale = modulator * self.alpha
         branch_scale_sq = branch_scale.square()
 
         centered_x = branch_out - branch_out.mean(dim=-1, keepdim=True)
         orth_x = centered_x - res_dir * (centered_x * res_dir).sum(dim=-1, keepdim = True) / torch.square(res_dir).sum(dim = -1, keepdim = True)
         orth_x = norm(orth_x)
-
-        res_dir = (res_dir + branch_scale.to(res_dir.dtype) * orth_x) / torch.sqrt(1 + branch_scale_sq).to(res_dir.dtype)
+        # switched to pure rms norm as dividing by predicted norm gain causes compounding res_dir drift due to precision 
+        #res_dir = (res_dir + branch_scale.to(res_dir.dtype) * orth_x) / torch.sqrt(1 + branch_scale_sq).to(res_dir.dtype)
+        res_dir = norm(res_dir + branch_scale.to(res_dir.dtype) * orth_x)
         res_log_norm = res_log_norm + torch.log1p(branch_scale_sq) * 0.5
 
         return res_log_norm, res_dir
