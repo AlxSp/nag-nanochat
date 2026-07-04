@@ -11,10 +11,18 @@ SCREEN_NAME="${SCREEN_NAME:-train_${RUN_NAME}}"
 RUN_IN_SCREEN="${RUN_IN_SCREEN:-1}"
 
 if [ "$RUN_IN_SCREEN" = "1" ] && [ -z "${INSIDE_TRAIN_SCREEN:-}" ]; then
-  command -v screen >/dev/null 2>&1 || { echo "screen is not installed. Set RUN_IN_SCREEN=0 or install screen."; exit 1; }
-  echo "Starting GPT baseline training in screen session: $SCREEN_NAME"
-  echo "Attach with: screen -r $SCREEN_NAME"
-  INSIDE_TRAIN_SCREEN=1 screen -dmS "$SCREEN_NAME" bash "$0"
+  if command -v screen >/dev/null 2>&1; then
+    echo "Starting GPT baseline training in screen session: $SCREEN_NAME"
+    echo "Attach with: screen -r $SCREEN_NAME"
+    INSIDE_TRAIN_SCREEN=1 screen -dmS "$SCREEN_NAME" bash "$0"
+  elif command -v tmux >/dev/null 2>&1; then
+    echo "Starting GPT baseline training in tmux session: $SCREEN_NAME"
+    echo "Attach with: tmux attach -t $SCREEN_NAME"
+    tmux new-session -d -s "$SCREEN_NAME" "cd '$REPO_DIR' && INSIDE_TRAIN_SCREEN=1 bash '$0'"
+  else
+    echo "Neither screen nor tmux is installed. Set RUN_IN_SCREEN=0 to run in the foreground."
+    exit 1
+  fi
   exit 0
 fi
 
@@ -54,4 +62,3 @@ printf 'Launching command:\n'
 printf '%q ' "${CMD[@]}"
 printf '\n'
 exec "${CMD[@]}"
-

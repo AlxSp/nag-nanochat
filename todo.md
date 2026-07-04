@@ -40,6 +40,7 @@ Rationale:
 - `/workspace` should hold the tokenizer, 1000-shard ClimbMix subset, checkpoints, optimizer shards, and logs.
 - A single saved 8-rank checkpoint set can be several GB; the downloaded step-3000/3500 checkpoint sample is already about 5.5 GB.
 - For paired NAG + GPT runs, 300 GB is the practical minimum I would choose; 500 GB is more comfortable if saving every 100 steps or keeping multiple failed/resumed attempts.
+- On a 250 GB `/workspace` volume, do not save every 100 steps for this run. Use `SAVE_EVERY=500` or larger, and prune partial/old checkpoints after failures.
 
 Before launch, verify:
 
@@ -208,11 +209,13 @@ cd /nag-nanochat
 scripts/train_h100_gpt_64x640.sh
 ```
 
-Both training scripts start in a `screen` session by default. Attach with:
+Both training scripts start in `screen` by default, or `tmux` if `screen` is not installed. Attach with one of:
 
 ```bash
 screen -r train_nag_gpt_d64_w640_3e19
 screen -r train_gpt_d64_w640_3e19
+tmux attach -t train_nag_gpt_d64_w640_3e19
+tmux attach -t train_gpt_d64_w640_3e19
 ```
 
 ## Fairness Requirements

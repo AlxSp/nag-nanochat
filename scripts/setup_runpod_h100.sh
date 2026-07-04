@@ -17,7 +17,7 @@ if ! command -v uv >/dev/null 2>&1; then
   export PATH="$HOME/.local/bin:$PATH"
 fi
 
-uv sync
+uv sync --extra gpu
 
 cat > "$BASE_DIR/env.sh" <<EOF
 export NANOCHAT_BASE_DIR="$BASE_DIR"
@@ -52,4 +52,3 @@ PY
 echo
 echo "Setup complete. For this shell, run:"
 echo "source $BASE_DIR/env.sh"
-
