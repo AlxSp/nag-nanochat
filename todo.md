@@ -23,6 +23,31 @@ Expected cache layout:
 /workspace/nanochat/report
 ```
 
+## RunPod Storage Recommendation
+
+Use persistent `/workspace` storage, not only ephemeral container storage, for this experiment.
+
+Recommended RunPod settings:
+
+```text
+Container disk: 100-150 GB
+Volume/network disk mounted at /workspace: 300-500 GB
+```
+
+Rationale:
+
+- Container disk only needs to cover the image, repo, venv, package/build caches, and temporary compile artifacts.
+- `/workspace` should hold the tokenizer, 1000-shard ClimbMix subset, checkpoints, optimizer shards, and logs.
+- A single saved 8-rank checkpoint set can be several GB; the downloaded step-3000/3500 checkpoint sample is already about 5.5 GB.
+- For paired NAG + GPT runs, 300 GB is the practical minimum I would choose; 500 GB is more comfortable if saving every 100 steps or keeping multiple failed/resumed attempts.
+
+Before launch, verify:
+
+```bash
+df -h /workspace
+du -sh /workspace/nanochat 2>/dev/null || true
+```
+
 ## Tokenizer
 
 Use the copied local tokenizer. Do not retrain it on the H100/H200 instance.
@@ -91,7 +116,13 @@ Use these settings for both NAG and GPT:
 
 Keep `torch.compile` enabled. Use all 8 GPUs with `torchrun`.
 
-Use the largest safe `--device-batch-size` that fits without OOM. Keep the same batch size policy for both runs.
+The earlier H100 run fit with `--device-batch-size=16`. Keep `DEVICE_BATCH_SIZE=16` for both runs unless memory forces a change, and document any override. The identified NaN trigger was the NAG modulator `pow` backward at `s=0`, not a confirmed microbatch-size issue.
+
+Shared settings live in:
+
+```bash
+runs/h100_64x640.env
+```
 
 ## Smoke Test
 
@@ -107,7 +138,45 @@ Before the main run, smoke test the NAG architecture on all 8 GPUs with the fina
 
 If the smoke test fails, adjust only runtime/training parameters. Do not change architecture code.
 
+Before launching the full run, also require FA3 to be active:
+
+```bash
+cd /nag-nanochat
+source runs/h100_64x640.env
+uv run python -m scripts.check_fa3
+```
+
+The train scripts run this check automatically and refuse to launch if FA3 is not selected.
+
+Then run the full-shape one-step smoke:
+
+```bash
+cd /nag-nanochat
+scripts/smoke_h100_nag_64x640.sh
+```
+
 ## Main Runs
+
+Instance setup:
+
+```bash
+cd /nag-nanochat
+scripts/setup_runpod_h100.sh
+source /workspace/nanochat/env.sh
+```
+
+Dataset download:
+
+```bash
+cd /nag-nanochat
+scripts/download_climbmix_1000.sh
+```
+
+Tokenizer upload from the local machine, using the direct RunPod SSH endpoint:
+
+```bash
+scripts/upload_tokenizer_to_runpod.sh root@HOST PORT ~/.ssh/id_ed25519 /workspace/nanochat
+```
 
 Run NAG first:
 
@@ -117,12 +186,33 @@ Run NAG first:
 --run=nag_gpt_d64_w640_3e19
 ```
 
+Or use:
+
+```bash
+cd /nag-nanochat
+scripts/train_h100_nag_64x640.sh
+```
+
 Then run GPT baseline with the exact same data/tokenizer/training budget:
 
 ```text
 --arch=gpt
 --model-tag=gpt_d64_w640_3e19
 --run=gpt_d64_w640_3e19
+```
+
+Or use:
+
+```bash
+cd /nag-nanochat
+scripts/train_h100_gpt_64x640.sh
+```
+
+Both training scripts start in a `screen` session by default. Attach with:
+
+```bash
+screen -r train_nag_gpt_d64_w640_3e19
+screen -r train_gpt_d64_w640_3e19
 ```
 
 ## Fairness Requirements
@@ -153,3 +243,14 @@ Then run GPT baseline with the exact same data/tokenizer/training budget:
 - Compare throughput, MFU, wall time, and actual trained tokens.
 - Inspect final NAG checkpoint for gain/modulator behavior.
 - Generate blog plots from both runs where possible.
+
+
+# Log:
+
+8xH100 run that resulted in NANs:
+```
+OMP_NUM_THREADS=1 NANOCHAT_BASE_DIR=/workspace/nanochat .venv/bin/torchrun --standalone --nproc_per_node=8 -m
+  scripts.base_train -- --arch=nag-gpt --depth=64 --model-dim=640 --head-dim=128 --window-pattern=L --target-flops=3e19 --target-
+  param-data-ratio=-1 --eval-every=250 --save-every=500 --sample-every=-1 --core-metric-every=999999 --model-
+  tag=nag_gpt_d64_w640_3e19 --run=nag_gpt_d64_w640_3e19 --device-batch-size=16
+```
