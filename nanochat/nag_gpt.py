@@ -320,6 +320,12 @@ class GPT(nn.Module):
             # for ve in self.value_embeds.values():
             #     ve.to(dtype=COMPUTE_DTYPE)
 
+    @torch.no_grad()
+    def set_gate_bias(self, bias):
+        for block in self.transformer.h:
+            block.attn_branch.m_down.bias.fill_(bias)
+            block.mlp_branch.m_down.bias.fill_(bias)
+
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=100000, device=None):
         # TODO: bump base theta more? e.g. 100K is more common more recently
         # autodetect the device from model embeddings
@@ -424,7 +430,7 @@ class GPT(nn.Module):
             'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5):
+    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5, nag_gate_lr=None):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
 
@@ -494,6 +500,9 @@ class GPT(nn.Module):
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
+        gate_lr = matrix_lr if nag_gate_lr is None else nag_gate_lr
+        if nag_gate_lr is not None:
+            print0(f"Using NAG gate LR override: {gate_lr:.6g}")
 
         # Build param_groups with all required fields explicit
         param_groups = [
@@ -502,9 +511,9 @@ class GPT(nn.Module):
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
             dict(kind='adamw', params=[self.g_log_encode], lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=alphas, lr=matrix_lr, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=betas, lr=matrix_lr, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=coefs, lr=matrix_lr, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=m_downs, lr=matrix_lr, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=betas, lr=gate_lr, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=coefs, lr=gate_lr, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=m_downs, lr=gate_lr, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
             # dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
             # dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
             # dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0

@@ -65,6 +65,8 @@ parser.add_argument("--unembedding-lr", type=float, default=0.008, help="learnin
 parser.add_argument("--weight-decay", type=float, default=0.28, help="cautious weight decay for the Muon optimizer (for weights)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
+parser.add_argument("--nag-gate-lr", type=float, default=-1.0, help="NAG-only LR for beta/coef/m_down gate params (-1 = use matrix-lr)")
+parser.add_argument("--nag-gate-bias-init", type=float, default=0.0, help="NAG-only initial m_down bias; positive values start gates more open")
 parser.add_argument("--warmup-steps", type=int, default=40, help="number of steps for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
@@ -168,6 +170,9 @@ base_dir = get_base_dir()
 output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
+if args.arch == "nag-gpt" and not resuming and args.nag_gate_bias_init != 0.0:
+    model.set_gate_bias(args.nag_gate_bias_init)
+    print0(f"Initialized NAG gate m_down bias to {args.nag_gate_bias_init}")
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
@@ -318,7 +323,7 @@ if weight_decay_scaled != args.weight_decay:
 
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
-optimizer = model.setup_optimizer(
+optimizer_kwargs = dict(
     # AdamW hyperparameters
     unembedding_lr=args.unembedding_lr * batch_lr_scale,
     embedding_lr=args.embedding_lr * batch_lr_scale,
@@ -327,6 +332,9 @@ optimizer = model.setup_optimizer(
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
 )
+if args.arch == "nag-gpt" and args.nag_gate_lr >= 0.0:
+    optimizer_kwargs["nag_gate_lr"] = args.nag_gate_lr * batch_lr_scale
+optimizer = model.setup_optimizer(**optimizer_kwargs)
 
 if resuming:
     optimizer.load_state_dict(optimizer_data)
