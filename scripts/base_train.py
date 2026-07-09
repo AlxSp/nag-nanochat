@@ -65,8 +65,9 @@ parser.add_argument("--unembedding-lr", type=float, default=0.008, help="learnin
 parser.add_argument("--weight-decay", type=float, default=0.28, help="cautious weight decay for the Muon optimizer (for weights)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
-parser.add_argument("--nag-gate-lr", type=float, default=-1.0, help="NAG-only LR for beta/coef/m_down gate params (-1 = use matrix-lr)")
-parser.add_argument("--nag-gate-bias-init", type=float, default=0.0, help="NAG-only initial m_down bias; positive values start gates more open")
+parser.add_argument("--nag-gate-lr", type=float, default=0.001, help="NAG-only LR for beta/coef/m_down gate params")
+parser.add_argument("--nag-alpha-warmup-tokens", type=int, default=600 * 2**19, help="NAG-only token-anchored alpha warmup (0 = disable)")
+parser.add_argument("--nag-gate-log-every", type=int, default=-1, help="NAG-only gate-health logging interval in steps (-1 = disable)")
 parser.add_argument("--warmup-steps", type=int, default=40, help="number of steps for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
@@ -170,9 +171,6 @@ base_dir = get_base_dir()
 output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
-if args.arch == "nag-gpt" and not resuming and args.nag_gate_bias_init != 0.0:
-    model.set_gate_bias(args.nag_gate_bias_init)
-    print0(f"Initialized NAG gate m_down bias to {args.nag_gate_bias_init}")
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
@@ -300,6 +298,9 @@ if total_batch_size == -1:
     predicted_batch_size = B_REF * batch_size_ratio ** 0.383
     total_batch_size = 2 ** round(math.log2(predicted_batch_size)) # clamp to nearest power of 2 for efficiency
     print0(f"Auto-computed optimal batch size: {total_batch_size:,} tokens")
+if args.arch == "nag-gpt" and args.nag_alpha_warmup_tokens > 0:
+    nag_alpha_warmup_steps = math.ceil(args.nag_alpha_warmup_tokens / total_batch_size)
+    print0(f"NAG alpha warmup: {args.nag_alpha_warmup_tokens:,} tokens (~{nag_alpha_warmup_steps:,} steps)")
 
 # 3) Knowing the batch size, we can now calculate a learning rate correction (bigger batch size allows higher learning rates)
 batch_lr_scale = 1.0
@@ -332,7 +333,7 @@ optimizer_kwargs = dict(
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
 )
-if args.arch == "nag-gpt" and args.nag_gate_lr >= 0.0:
+if args.arch == "nag-gpt":
     optimizer_kwargs["nag_gate_lr"] = args.nag_gate_lr * batch_lr_scale
 optimizer = model.setup_optimizer(**optimizer_kwargs)
 
@@ -437,6 +438,8 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
+    if args.arch == "nag-gpt" and args.nag_alpha_warmup_tokens > 0:
+        orig_model.set_alpha_warmup_scale(min(1.0, (step * total_batch_size) / args.nag_alpha_warmup_tokens))
 
     # once in a while: evaluate the val bpb (all ranks participate)
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
@@ -616,6 +619,27 @@ while True:
             "train/epoch": epoch,
         }
         wandb_run.log(log_data, step=step)
+    if args.nag_gate_log_every > 0 and args.arch == "nag-gpt" and master_process and step % args.nag_gate_log_every == 0:
+        with disable_fp8(orig_model):
+            gate_log_data = orig_model.collect_gate_stats(x[:1])
+        if gate_log_data:
+            print0(
+                "NAG gates | "
+                f"mean_abs_gain: {gate_log_data['nag_gate/mean_abs_gain']:.4f} | "
+                f"floor_frac: {gate_log_data['nag_gate/floor_frac']:.4f} | "
+                f"dead: {gate_log_data['nag_gate/dead_branches']} | "
+                f"floor50: {gate_log_data['nag_gate/floor50_branches']} | "
+                f"q_gain: {gate_log_data.get('nag_gate/q0_mean_abs_gain', 0):.3f}/"
+                f"{gate_log_data.get('nag_gate/q1_mean_abs_gain', 0):.3f}/"
+                f"{gate_log_data.get('nag_gate/q2_mean_abs_gain', 0):.3f}/"
+                f"{gate_log_data.get('nag_gate/q3_mean_abs_gain', 0):.3f}"
+            )
+            gate_log_data.update({
+                "step": step,
+                "total_training_flops": flops_so_far,
+                "total_training_time": total_training_time,
+            })
+            wandb_run.log(gate_log_data, step=step)
 
     # state update
     first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)

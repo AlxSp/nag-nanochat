@@ -142,19 +142,40 @@ class MLP(nn.Module):
         return x
 
 class NAGResBranch(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, layer_idx, branch_kind):
         super().__init__()
 
+        self.layer_idx = layer_idx
+        self.branch_kind = branch_kind
+        self._gate_stats = None
         self.m_down = Linear(config.n_embd, 32, bias=True)
         self.coef = nn.Parameter(torch.zeros(32))
         self.beta = nn.Parameter(torch.zeros(1))
 
         self.alpha = nn.Parameter(torch.zeros(1))
+        self.register_buffer("alpha_warmup_scale", torch.ones(()), persistent=False)
 
     def forward(self, res_log_norm, res_dir, branch_out):
-        modulator = (F.softmax(self.coef, dim=0) * F.sigmoid(self.m_down(res_dir))).sum(dim=-1).clamp_min(1e-6).pow(F.softplus(self.beta) + 1e-16).unsqueeze(-1) # clamp to avoid inf backward gradient when mod = 0
-        branch_scale = modulator * self.alpha
+        s = (F.softmax(self.coef, dim=0) * F.sigmoid(self.m_down(res_dir))).sum(dim=-1)
+        p = F.softplus(self.beta)
+        modulator = s.clamp_min(1e-6).pow(p).unsqueeze(-1) # clamp to avoid inf backward gradient when mod = 0
+        branch_scale = modulator * self.alpha * self.alpha_warmup_scale
         branch_scale_sq = branch_scale.square()
+        if self._gate_stats is not None:
+            with torch.no_grad():
+                gain = branch_scale.squeeze(-1).float()
+                self._gate_stats.append({
+                    "layer_idx": self.layer_idx,
+                    "branch_kind": self.branch_kind,
+                    "mean_s": s.float().mean(),
+                    "min_s": s.float().amin(),
+                    "floor_frac": (s <= 1e-6).float().mean(),
+                    "mean_gain": gain.mean(),
+                    "mean_abs_gain": gain.abs().mean(),
+                    "on_frac": (gain.abs() > 0.25).float().mean(),
+                    "alpha": self.alpha.float().mean(),
+                    "p": p.float().mean(),
+                })
 
         centered_x = branch_out - branch_out.mean(dim=-1, keepdim=True)
         orth_x = centered_x - res_dir * (centered_x * res_dir).sum(dim=-1, keepdim = True) / torch.square(res_dir).sum(dim = -1, keepdim = True)
@@ -169,9 +190,9 @@ class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.attn_branch = NAGResBranch(config, layer_idx)
+        self.attn_branch = NAGResBranch(config, layer_idx, "attn")
         self.mlp = MLP(config)
-        self.mlp_branch = NAGResBranch(config, layer_idx)
+        self.mlp_branch = NAGResBranch(config, layer_idx, "mlp")
 
     def forward(self, res_log_norm, res_dir, ve, cos_sin, window_size, kv_cache):
 
@@ -282,6 +303,8 @@ class GPT(nn.Module):
             block.mlp_branch.beta.fill_(0.5413)
             block.mlp_branch.coef.zero_()
 
+        self.set_alpha_warmup_scale(1.0)
+
 
 
         # Per-layer scalars
@@ -321,10 +344,83 @@ class GPT(nn.Module):
             #     ve.to(dtype=COMPUTE_DTYPE)
 
     @torch.no_grad()
-    def set_gate_bias(self, bias):
+    def set_alpha_warmup_scale(self, scale):
         for block in self.transformer.h:
-            block.attn_branch.m_down.bias.fill_(bias)
-            block.mlp_branch.m_down.bias.fill_(bias)
+            block.attn_branch.alpha_warmup_scale.fill_(scale)
+            block.mlp_branch.alpha_warmup_scale.fill_(scale)
+
+    def _res_branches(self):
+        for block in self.transformer.h:
+            yield block.attn_branch
+            yield block.mlp_branch
+
+    @torch.no_grad()
+    def collect_gate_stats(self, idx):
+        was_training = self.training
+        stats = []
+        try:
+            self.eval()
+            for branch in self._res_branches():
+                branch._gate_stats = stats
+            _ = self(idx)
+        finally:
+            for branch in self._res_branches():
+                branch._gate_stats = None
+            if was_training:
+                self.train()
+        return self._summarize_gate_stats(stats)
+
+    def _summarize_gate_stats(self, stats):
+        if not stats:
+            return {}
+
+        rows = []
+        for row in stats:
+            rows.append({
+                "layer_idx": row["layer_idx"],
+                "branch_kind": row["branch_kind"],
+                "mean_s": float(row["mean_s"].detach().cpu()),
+                "min_s": float(row["min_s"].detach().cpu()),
+                "floor_frac": float(row["floor_frac"].detach().cpu()),
+                "mean_gain": float(row["mean_gain"].detach().cpu()),
+                "mean_abs_gain": float(row["mean_abs_gain"].detach().cpu()),
+                "on_frac": float(row["on_frac"].detach().cpu()),
+                "alpha": float(row["alpha"].detach().cpu()),
+                "p": float(row["p"].detach().cpu()),
+            })
+
+        def mean(key, group=None):
+            values = [row[key] for row in rows if group is None or row["branch_kind"] == group]
+            return sum(values) / max(len(values), 1)
+
+        log = {
+            "nag_gate/mean_s": mean("mean_s"),
+            "nag_gate/min_s": min(row["min_s"] for row in rows),
+            "nag_gate/floor_frac": mean("floor_frac"),
+            "nag_gate/mean_gain": mean("mean_gain"),
+            "nag_gate/mean_abs_gain": mean("mean_abs_gain"),
+            "nag_gate/on_frac": mean("on_frac"),
+            "nag_gate/min_p": min(row["p"] for row in rows),
+            "nag_gate/mean_p": mean("p"),
+            "nag_gate/dead_branches": sum(row["mean_abs_gain"] < 0.05 for row in rows),
+            "nag_gate/floor50_branches": sum(row["floor_frac"] > 0.5 for row in rows),
+            "nag_gate/attn_floor_frac": mean("floor_frac", "attn"),
+            "nag_gate/mlp_floor_frac": mean("floor_frac", "mlp"),
+        }
+
+        rows_by_depth = sorted(rows, key=lambda row: (row["layer_idx"], row["branch_kind"]))
+        quartile_size = max(len(rows_by_depth) // 4, 1)
+        for i in range(4):
+            quartile = rows_by_depth[i * quartile_size:(i + 1) * quartile_size]
+            if quartile:
+                log[f"nag_gate/q{i}_mean_abs_gain"] = sum(row["mean_abs_gain"] for row in quartile) / len(quartile)
+                log[f"nag_gate/q{i}_floor_frac"] = sum(row["floor_frac"] for row in quartile) / len(quartile)
+
+        for row in rows:
+            name = f"nag_gate/l{row['layer_idx']:02d}_{row['branch_kind']}"
+            log[f"{name}/mean_abs_gain"] = row["mean_abs_gain"]
+            log[f"{name}/floor_frac"] = row["floor_frac"]
+        return log
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=100000, device=None):
         # TODO: bump base theta more? e.g. 100K is more common more recently
@@ -502,7 +598,7 @@ class GPT(nn.Module):
         print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
         gate_lr = matrix_lr if nag_gate_lr is None else nag_gate_lr
         if nag_gate_lr is not None:
-            print0(f"Using NAG gate LR override: {gate_lr:.6g}")
+            print0(f"Using NAG gate LR: {gate_lr:.6g}")
 
         # Build param_groups with all required fields explicit
         param_groups = [
@@ -510,7 +606,7 @@ class GPT(nn.Module):
             dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
             dict(kind='adamw', params=[self.g_log_encode], lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=alphas, lr=matrix_lr, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=alphas, lr=gate_lr, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=betas, lr=gate_lr, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=coefs, lr=gate_lr, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=m_downs, lr=gate_lr, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),

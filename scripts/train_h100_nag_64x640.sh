@@ -5,7 +5,7 @@ REPO_DIR="${REPO_DIR:-/nag-nanochat}"
 cd "$REPO_DIR"
 source runs/h100_64x640.env
 
-RUN_NAME="${RUN_NAME:-nag_gpt_d64_w640_3e19}"
+RUN_NAME="${RUN_NAME:-nag_gpt_d64_w640_3e19_gatefix}"
 MODEL_TAG="${MODEL_TAG:-$RUN_NAME}"
 SCREEN_NAME="${SCREEN_NAME:-train_${RUN_NAME}}"
 RUN_IN_SCREEN="${RUN_IN_SCREEN:-1}"
@@ -51,6 +51,7 @@ CMD=(
   "--unembedding-lr=$UNEMBEDDING_LR"
   "--scalar-lr=$SCALAR_LR"
   "--eval-every=$EVAL_EVERY"
+  "--nag-gate-log-every=$NAG_GATE_LOG_EVERY"
   "--save-every=$SAVE_EVERY"
   "--sample-every=$SAMPLE_EVERY"
   "--core-metric-every=$CORE_METRIC_EVERY"
