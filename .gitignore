@@ -15,6 +15,7 @@ runs/checkpoints/
 
 # NAG experiment artifacts (checkpoints/data live on HF: AlxSp/nag-nanochat-d64)
 checkpoints/
+dev/figures/output/
 runs/base_checkpoints/
 runs/base_eval/
 runs/report/

@@ -38,6 +38,8 @@ branch.
   `--nag-gate-lr=0.001` with `--matrix-lr=0.012`, plus a 314,572,800-token
   `--nag-alpha-warmup-tokens` ramp. `--nag-gate-log-every` reports realized gain,
   modulator floor fraction, and dead-branch count.
+- **`dev/figures/`**: scripts that generate the writeup figures, runnable on CPU
+  against the released checkpoints (see [dev/figures/README.md](dev/figures/README.md)).
 - **`scripts/` / `runs/`**: shared configuration, preflight checks, and launchers
   for the FLOP-matched 8×H100 pair.
 
