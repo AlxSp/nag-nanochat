@@ -36,18 +36,27 @@ def adamw_step_fused(
     All in one compiled graph to eliminate Python overhead between ops.
     The 0-D CPU tensors avoid recompilation when hyperparameter values change.
     """
+    # Some params such as token embeddings are stored in bf16. Do AdamW math in fp32
+    # and cast back at the end so beta/epsilon arithmetic keeps its precision.
+    p32 = p.float()
+    exp_avg32 = exp_avg.float()
+    exp_avg_sq32 = exp_avg_sq.float()
+    grad32 = grad.float()
     # Weight decay (decoupled, applied before the update)
-    p.mul_(1 - lr_t * wd_t)
+    p32.mul_(1 - lr_t * wd_t)
     # Update running averages (lerp_ is cleaner and fuses well)
-    exp_avg.lerp_(grad, 1 - beta1_t)
-    exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
+    exp_avg32.lerp_(grad32, 1 - beta1_t)
+    exp_avg_sq32.lerp_(grad32.square(), 1 - beta2_t)
     # Bias corrections
     bias1 = 1 - beta1_t ** step_t
     bias2 = 1 - beta2_t ** step_t
     # Compute update and apply
-    denom = (exp_avg_sq / bias2).sqrt() + eps_t
+    denom = (exp_avg_sq32 / bias2).sqrt() + eps_t
     step_size = lr_t / bias1
-    p.add_(exp_avg / denom, alpha=-step_size)
+    p32.add_(exp_avg32 / denom, alpha=-step_size)
+    p.copy_(p32)
+    exp_avg.copy_(exp_avg32)
+    exp_avg_sq.copy_(exp_avg_sq32)
 
 # -----------------------------------------------------------------------------
 """
@@ -373,6 +382,8 @@ class DistMuonAdamW(torch.optim.Optimizer):
         param_infos = {}
         for p in group['params']:
             grad = p.grad
+            if grad is None:
+                continue
             if p.numel() < 1024:
                 # Small params: all_reduce (no scatter/gather needed)
                 future = dist.all_reduce(grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
@@ -411,6 +422,8 @@ class DistMuonAdamW(torch.optim.Optimizer):
         """Wait for reduce, compute AdamW updates, launch gathers for large params."""
         param_infos = info['param_infos']
         for p in group['params']:
+            if p not in param_infos:
+                continue
             pinfo = param_infos[p]
             pinfo['future'].wait()
             grad_slice = pinfo['grad_slice']

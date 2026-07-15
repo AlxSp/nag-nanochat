@@ -25,7 +25,6 @@ import wandb
 import torch
 import torch.distributed as dist
 
-from nanochat.gpt import GPT, GPTConfig, Linear
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -47,8 +46,10 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU and torchao)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
 # Model architecture
+parser.add_argument("--arch", type=str, default="gpt", choices=["gpt", "nag-gpt"], help="model architecture to train")
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
+parser.add_argument("--model-dim", type=int, default=-1, help="override model dimension directly (-1 = derive from depth * aspect_ratio)")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
@@ -64,6 +65,9 @@ parser.add_argument("--unembedding-lr", type=float, default=0.008, help="learnin
 parser.add_argument("--weight-decay", type=float, default=0.28, help="cautious weight decay for the Muon optimizer (for weights)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
+parser.add_argument("--nag-gate-lr", type=float, default=0.001, help="NAG-only LR for beta/coef/m_down gate params")
+parser.add_argument("--nag-alpha-warmup-tokens", type=int, default=600 * 2**19, help="NAG-only token-anchored alpha warmup (0 = disable)")
+parser.add_argument("--nag-gate-log-every", type=int, default=-1, help="NAG-only gate-health logging interval in steps (-1 = disable)")
 parser.add_argument("--warmup-steps", type=int, default=40, help="number of steps for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
@@ -79,6 +83,10 @@ parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
+if args.arch == "nag-gpt":
+    from nanochat.nag_gpt import GPT, GPTConfig, Linear
+else:
+    from nanochat.gpt import GPT, GPTConfig, Linear
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
 
@@ -98,6 +106,9 @@ print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
+if not use_dummy_wandb:
+    wandb_run.define_metric("step")
+    wandb_run.define_metric("*", step_metric="step")
 
 # Flash Attention status
 from nanochat.flash_attention import USE_FA3
@@ -128,10 +139,15 @@ print0(f"Vocab size: {vocab_size:,}")
 
 def build_model_meta(depth):
     """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
-    # Model dim is nudged up to nearest multiple of head_dim for clean division
-    # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
-    base_dim = depth * args.aspect_ratio
-    model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
+    if args.model_dim != -1:
+        model_dim = args.model_dim
+        assert model_dim > 0, f"model_dim must be positive, got {model_dim}"
+        assert model_dim % args.head_dim == 0, f"model_dim ({model_dim}) must be divisible by head_dim ({args.head_dim})"
+    else:
+        # Model dim is nudged up to nearest multiple of head_dim for clean division
+        # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
+        base_dim = depth * args.aspect_ratio
+        model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
@@ -282,6 +298,9 @@ if total_batch_size == -1:
     predicted_batch_size = B_REF * batch_size_ratio ** 0.383
     total_batch_size = 2 ** round(math.log2(predicted_batch_size)) # clamp to nearest power of 2 for efficiency
     print0(f"Auto-computed optimal batch size: {total_batch_size:,} tokens")
+if args.arch == "nag-gpt" and args.nag_alpha_warmup_tokens > 0:
+    nag_alpha_warmup_steps = math.ceil(args.nag_alpha_warmup_tokens / total_batch_size)
+    print0(f"NAG alpha warmup: {args.nag_alpha_warmup_tokens:,} tokens (~{nag_alpha_warmup_steps:,} steps)")
 
 # 3) Knowing the batch size, we can now calculate a learning rate correction (bigger batch size allows higher learning rates)
 batch_lr_scale = 1.0
@@ -305,7 +324,7 @@ if weight_decay_scaled != args.weight_decay:
 
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
-optimizer = model.setup_optimizer(
+optimizer_kwargs = dict(
     # AdamW hyperparameters
     unembedding_lr=args.unembedding_lr * batch_lr_scale,
     embedding_lr=args.embedding_lr * batch_lr_scale,
@@ -314,6 +333,9 @@ optimizer = model.setup_optimizer(
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
 )
+if args.arch == "nag-gpt":
+    optimizer_kwargs["nag_gate_lr"] = args.nag_gate_lr * batch_lr_scale
+optimizer = model.setup_optimizer(**optimizer_kwargs)
 
 if resuming:
     optimizer.load_state_dict(optimizer_data)
@@ -416,6 +438,8 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
+    if args.arch == "nag-gpt" and args.nag_alpha_warmup_tokens > 0:
+        orig_model.set_alpha_warmup_scale(min(1.0, (step * total_batch_size) / args.nag_alpha_warmup_tokens))
 
     # once in a while: evaluate the val bpb (all ranks participate)
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
@@ -432,7 +456,7 @@ while True:
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "val/bpb": val_bpb,
-        })
+        }, step=step)
         model.train()
 
     # once in a while: estimate the CORE metric (all ranks participate)
@@ -449,7 +473,7 @@ while True:
             "total_training_flops": flops_so_far,
             "core_metric": results["core_metric"],
             "centered_results": results["centered_results"],
-        })
+        }, step=step)
         model.train()
 
     # once in a while: sample from the model (only on master process)
@@ -516,6 +540,20 @@ while True:
         else:
             loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+    local_nonfinite = torch.tensor(0, dtype=torch.int32, device=device)
+    if not torch.isfinite(train_loss):
+        local_nonfinite.fill_(1)
+    bad_grad_names = []
+    for name, p in orig_model.named_parameters():
+        if p.grad is not None and not torch.isfinite(p.grad).all():
+            local_nonfinite.fill_(1)
+            if len(bad_grad_names) < 10:
+                bad_grad_names.append(name)
+    if is_ddp_initialized():
+        dist.all_reduce(local_nonfinite, op=dist.ReduceOp.MAX)
+    if local_nonfinite.item():
+        detail = f"; local bad gradients: {bad_grad_names}" if bad_grad_names else ""
+        raise RuntimeError(f"Non-finite loss/gradient detected at step {step} before optimizer.step(){detail}")
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -537,6 +575,9 @@ while True:
         scaler.update()
     else:
         optimizer.step()
+
+    if hasattr(model, "constrain_emb"):
+        model.constrain_emb()
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
@@ -577,7 +618,28 @@ while True:
             "train/mfu": mfu,
             "train/epoch": epoch,
         }
-        wandb_run.log(log_data)
+        wandb_run.log(log_data, step=step)
+    if args.nag_gate_log_every > 0 and args.arch == "nag-gpt" and master_process and step % args.nag_gate_log_every == 0:
+        with disable_fp8(orig_model):
+            gate_log_data = orig_model.collect_gate_stats(x[:1])
+        if gate_log_data:
+            print0(
+                "NAG gates | "
+                f"mean_abs_gain: {gate_log_data['nag_gate/mean_abs_gain']:.4f} | "
+                f"floor_frac: {gate_log_data['nag_gate/floor_frac']:.4f} | "
+                f"dead: {gate_log_data['nag_gate/dead_branches']} | "
+                f"floor50: {gate_log_data['nag_gate/floor50_branches']} | "
+                f"q_gain: {gate_log_data.get('nag_gate/q0_mean_abs_gain', 0):.3f}/"
+                f"{gate_log_data.get('nag_gate/q1_mean_abs_gain', 0):.3f}/"
+                f"{gate_log_data.get('nag_gate/q2_mean_abs_gain', 0):.3f}/"
+                f"{gate_log_data.get('nag_gate/q3_mean_abs_gain', 0):.3f}"
+            )
+            gate_log_data.update({
+                "step": step,
+                "total_training_flops": flops_so_far,
+                "total_training_time": total_training_time,
+            })
+            wandb_run.log(gate_log_data, step=step)
 
     # state update
     first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)

@@ -1,3 +1,73 @@
+# nag-nanochat
+
+A fork of [karpathy/nanochat](https://github.com/karpathy/nanochat) implementing
+**NAG - Norm-Agnostic Residual Networks** ([arXiv:2606.16112](https://arxiv.org/abs/2606.16112),
+Zyphra) on dense transformers. The residual stream is split into an RMS-normalized
+*direction* and a separate fp32 *log-norm lane*: layer outputs are orthogonalized
+against the residual and injected through a per-layer gate (α·m), and the accumulated
+norm acts as a learned inverse temperature at decode. The paper's Mixture-of-Depths
+(MoD) extension is not implemented in this fork.
+
+**Writeup:** [Norm-Agnostic Residual Networks: An Annotated Walkthrough and Reimplementation](https://alexanderspeicher.com/blog/norm-agnostic-residual-networks)
+
+## Results
+
+FLOP-matched pair at 3e19 FLOPs (64 layers × 640 dim, ~359M params, 9.9B ClimbMix
+tokens, 8×H100):
+
+| run | val bpb ↓ | CORE ↑ |
+|---|---:|---:|
+| GPT baseline | **0.7503** | 0.2225 |
+| NAG, broken (gate collapse) | 0.7858 | 0.2010 |
+| NAG, fixed | 0.7589 | **0.2373** |
+
+All three checkpoints + tokenizer:
+[AlxSp/nag-nanochat-d64](https://huggingface.co/AlxSp/nag-nanochat-d64).
+Figure-generation code and instructions live on the
+[`nag-figures`](https://github.com/AlxSp/nag-nanochat/tree/nag-figures/dev/figures)
+branch.
+
+## What's changed vs upstream
+
+- **`nanochat/nag_gpt.py`**: the NAG model, selected with `--arch=nag-gpt`.
+  It implements the paper's Eqs. 12–18 with two documented numerical deviations:
+  renormalization uses a measured `rms_norm` instead of the predicted gain divisor,
+  and the modulator is clamped to `1e-6` before `pow` to avoid an infinite bf16
+  backward gradient at exactly zero.
+- **`scripts/base_train.py`**: NAG training controls. The released fixed run uses
+  `--nag-gate-lr=0.001` with `--matrix-lr=0.012`, plus a 314,572,800-token
+  `--nag-alpha-warmup-tokens` ramp. `--nag-gate-log-every` reports realized gain,
+  modulator floor fraction, and dead-branch count.
+- **`scripts/` / `runs/`**: shared configuration, preflight checks, and launchers
+  for the FLOP-matched 8×H100 pair.
+
+## Training a NAG model
+
+Identical to nanochat, plus the arch flag — the NAG-specific defaults are already set:
+
+```bash
+uv run torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- \
+  --arch=nag-gpt --depth=64 --model-dim=640 --head-dim=128 --target-flops=3e19
+```
+
+To reproduce the released pair, place the released tokenizer under
+`$NANOCHAT_BASE_DIR/tokenizer` on the training host (`runs/h100_64x640.env`
+defaults `NANOCHAT_BASE_DIR` to `/workspace/nanochat`). The checked-in scripts then
+download the exact 1,000-shard ClimbMix subset, run the preflight, and launch the
+matched jobs:
+
+```bash
+scripts/download_climbmix_1000.sh
+scripts/smoke_h100_nag_64x640.sh
+scripts/train_h100_nag_64x640.sh
+scripts/train_h100_gpt_64x640.sh
+```
+
+---
+
+*Everything below is the original nanochat README. All credit for the harness,
+training stack, and evals goes to nanochat; MIT license unchanged.*
+
 # nanochat
 
 ![nanochat logo](dev/nanochat.png)

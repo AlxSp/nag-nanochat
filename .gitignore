@@ -11,3 +11,11 @@ eval_bundle/
 # Local setup
 CLAUDE.md
 wandb/
+runs/checkpoints/
+
+# NAG experiment artifacts (checkpoints/data live on HF: AlxSp/nag-nanochat-d64)
+checkpoints/
+runs/base_checkpoints/
+runs/base_eval/
+runs/report/
+runs/tokenizer/
