@@ -1,3 +1,72 @@
+# nag-nanochat
+
+A fork of [karpathy/nanochat](https://github.com/karpathy/nanochat) implementing
+**NAG — Norm-Agnostic Residual Networks** ([arXiv:2606.16112](https://arxiv.org/abs/2606.16112),
+Zyphra) on dense transformers. The residual stream is split into an RMS-normalized
+*direction* and a separate fp32 *log-norm lane*: layer outputs are orthogonalized
+against the residual and injected through a per-layer gate (α·m), and the accumulated
+norm acts as a learned inverse temperature at decode — the model carries an explicit,
+readable confidence scalar.
+
+**Full writeup: [Scaling Adaptive Depth with Norm-Agnostic Residual Networks](https://alexanderspeicher.com/blog/norm-agnostic-residual-networks)** —
+an annotated walkthrough of the paper plus the replication story: a bf16 NaN crash,
+a gate-collapse failure mode, the two training-dynamics fixes, and a pre-registered
+rerun that landed inside its predicted band.
+
+## Results
+
+FLOP-matched pair at 3e19 FLOPs (64 layers × 640 dim, ~359M params, 9.9B ClimbMix
+tokens, 8×H100):
+
+| run | val bpb ↓ | CORE ↑ |
+|---|---:|---:|
+| GPT baseline | **0.7503** | 0.2225 |
+| NAG, broken (gate collapse) | 0.7858 | 0.2010 |
+| NAG, fixed | 0.7589 | **0.2373** |
+
+NAG trails slightly on bpb — a gap that shrank 0.038 → 0.016 → 0.009 as budget
+grew 30× — but wins the CORE downstream eval. All three checkpoints + tokenizer:
+[AlxSp/nag-nanochat-d64](https://huggingface.co/AlxSp/nag-nanochat-d64).
+W&B: [NAG (fixed)](https://wandb.ai/alxsp/nanochat/runs/6k7abhwv) ·
+[GPT baseline](https://wandb.ai/alxsp/nanochat/runs/dqa8vb5n).
+
+## What's changed vs upstream
+
+- **`nanochat/nag_gpt.py`** — the NAG model, selected with `--arch=nag-gpt`.
+  Maps 1:1 onto the paper's Eqs. 12–18; two deviations are documented inline
+  (renormalizing with a measured rms_norm instead of the predicted gain divisor,
+  and a `clamp_min(1e-6)` before the modulator `pow` that prevents an infinite
+  backward gradient when the modulator hits exactly 0 in bf16).
+- **`scripts/base_train.py`** — NAG flags with validated defaults:
+  `--nag-gate-lr` (1e-3: gates and α must train ~17× slower than the matrices,
+  or the gates collapse into an absorbing off-state) and
+  `--nag-alpha-warmup-tokens` (3.1e8: branch injection ramps in linearly,
+  since N_out otherwise amplifies untrained branch outputs into pure noise).
+  Plus `--nag-gate-log-every` telemetry: per-branch realized gain, modulator
+  floor fraction, dead-branch count.
+- **`dev/figures/`** — the scripts that generate every figure in the blog post,
+  runnable on CPU against the released checkpoints (see
+  [dev/figures/README.md](dev/figures/README.md)).
+- **`scripts/` / `runs/`** — launchers for the FLOP-matched 8×H100 pairs and
+  the local 2×5090 diagnostic runs.
+
+Not implemented: MoD (adaptive depth), CCA, MoE — dense models only, to isolate
+the residual-stream change.
+
+## Training a NAG model
+
+Identical to nanochat, plus the arch flag — the NAG-specific defaults are already set:
+
+```bash
+torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- \
+  --arch=nag-gpt --depth=64 --model-dim=640 --head-dim=128 --target-flops=3e19
+```
+
+---
+
+*Everything below is the original nanochat README. All credit for the harness,
+training stack, and evals goes to nanochat; MIT license unchanged.*
+
 # nanochat
 
 ![nanochat logo](dev/nanochat.png)
